@@ -104,7 +104,7 @@ model_group.add_argument('--hidden_dim', type=int, default=256, help='hidden dim
 
 model_group.add_argument('--kl_loss_weight', type=float, default=0., help='KL loss weight')
 
-model_group.add_argument('--model_name', type=str, default=None)
+model_group.add_argument('--model_name', type=str, default=MODEL_NAME)
 
 args = parser.parse_args()
 
@@ -175,8 +175,8 @@ vae_params = dict(
 )
 
 vae_name = 'vae' if args.model_name is None else args.model_name + '-vae'
-vae_path = Path(args.vae_path)
-if args.resume and vae_path.exists():
+vae_path = Path(args.vae_path) if args.vae_path is not None else None
+if args.resume and vae_path is not None and vae_path.exists():
     loaded_obj = torch.load(str(vae_path))
     resume_epoch = loaded_obj.get('epoch', 0)
     v_params, weights = loaded_obj['hparams'], loaded_obj['weights']
@@ -184,7 +184,7 @@ if args.resume and vae_path.exists():
     vae.load_state_dict(weights)
     print_blue(f"resuming training of {args.vae_path} from epoch {resume_epoch}")
 else:
-    if args.resume and not vae_path.exists():
+    if args.resume and (vae_path is None or not vae_path.exists()):
         print_warn(f"Couldn't find a checkpoint at {args.vae_path}!")
         new_vae_input = ''
         while new_vae_input != 'y' and new_vae_input != 'n':
