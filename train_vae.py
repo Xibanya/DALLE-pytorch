@@ -104,7 +104,7 @@ model_group.add_argument('--hidden_dim', type=int, default=256, help='hidden dim
 
 model_group.add_argument('--kl_loss_weight', type=float, default=0., help='KL loss weight')
 
-model_group.add_argument('--model_name', type=str, default=MODEL_NAME)
+model_group.add_argument('--model_name', type=str, default=None)
 
 args = parser.parse_args()
 
