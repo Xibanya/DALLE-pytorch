@@ -6,42 +6,65 @@ image_text_folder: '../Dataset'
 wandb_name: 'dalle_train_transformer'
 dalle_output_file_name: 'dalle'
 
-epochs: 5
+epochs: 2
+img_gen_steps: 25
+top_k:
+  - 0.9
+  - 0.8
+temperature:
+  - 1.0
 
+############ OPTIMIZER ############
 optimizer: 'Adam'  # Adam, AdamW, RAdam
+learning_rate: 0.03 # default 3e-4
 # The exponential decay rate for the first moment estimates (e.g. 0.9)
 beta1: 0.9
 # The exponential decay rate for the second-moment estimates (e.g. 0.999)
 # This value should be set close to 1.0 on problems with a sparse gradient
 beta2: 0.999
-learning_rate: 0.03 # 3e-4 # default: 3e-4
-epsilon: 0.1 # default: 1e-8
-weight_decay: 0  # default 0
+epsilon: 1e-11 # default 1e-8
+weight_decay: 0.0 # default 0
+amsgrad: True
 
-depth: 8
+############ LR DECAY ############
+lr_decay: True
+min_lr: 1e-19 # default 1e-6
+# Number of epochs with no improvement after
+# which learning rate will be reduced.
+# default 10
+patience: 2
+# Number of epochs to wait before resuming
+# normal operation after lr has been reduced.
+# default 10
+cooldown: 10
+# Factor by which the learning rate will be
+# reduced. new_lr = lr * factor.
+# default 0.5
+decay_factor: 0.5
+# Threshold for measuring the new optimum,
+# to only focus on significant changes. Default: 1e-4.
+threshold: 1e-4
+# Minimal decay applied to lr. If the difference
+# between new and old lr is smaller than eps, the update is
+# ignored. Default: 1e-8.
+eps: 1e-16
+
+depth: 4
 batch_size: 4
 clip_grad_norm: 0.5
 heads: 8
 img_loss_weight: 7  # default 7
-dim_head: 64
-resize_ratio: 0.75
-attention_dropout: 0.0
-ff_dropout: 0.0
+dim_head: 64  # default 64
+resize_ratio: 0.8  # default 0.75
+attention_dropout: 0.0  # default 0.0
+ff_dropout: 0.0  # default 0.0
 
-img_gen_steps: 50
-top_k:
-  - 0.99
-  - 0.95
-  - 0.9
-temperature:
-  - 1.0
-  - 1.0
-  - 1.0
-
-rotary_emb: True
-lr_decay: False
-shift_tokens: True
-truncate_captions: True
+# print to console samples per second
+verbose_sample_per_sec: False
+rotary_emb: False
+shift_tokens: False
+truncate_captions: False
 reversible: False
-stable_softmax: False
+stable_softmax: False  # only used when creating a new model
+fp16: False  # 16 bit precision
 amp: False  # only used with deepspeed
