@@ -1,0 +1,47 @@
+use_config: True
+
+vae_path: './city_vae-final.pt'
+dalle_path: './dalle.pt'
+image_text_folder: '../Dataset'
+wandb_name: 'dalle_train_transformer'
+dalle_output_file_name: 'dalle'
+
+epochs: 5
+
+optimizer: 'Adam'  # Adam, AdamW, RAdam
+# The exponential decay rate for the first moment estimates (e.g. 0.9)
+beta1: 0.9
+# The exponential decay rate for the second-moment estimates (e.g. 0.999)
+# This value should be set close to 1.0 on problems with a sparse gradient
+beta2: 0.999
+learning_rate: 0.03 # 3e-4 # default: 3e-4
+epsilon: 0.1 # default: 1e-8
+weight_decay: 0  # default 0
+
+depth: 8
+batch_size: 4
+clip_grad_norm: 0.5
+heads: 8
+img_loss_weight: 7  # default 7
+dim_head: 64
+resize_ratio: 0.75
+attention_dropout: 0.0
+ff_dropout: 0.0
+
+img_gen_steps: 50
+top_k:
+  - 0.99
+  - 0.95
+  - 0.9
+temperature:
+  - 1.0
+  - 1.0
+  - 1.0
+
+rotary_emb: True
+lr_decay: False
+shift_tokens: True
+truncate_captions: True
+reversible: False
+stable_softmax: False
+amp: False  # only used with deepspeed
