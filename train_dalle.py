@@ -7,9 +7,10 @@ from tqdm import tqdm
 import shutil
 
 import torch
-import wandb  # Quit early if user doesn't have wandb installed.
+import wandb
+import yaml
 from torch.nn.utils import clip_grad_norm_
-from torch.optim import Adam, Adamax, Adagrad, AdamW, RAdam, NAdam
+from torch.optim import Adam, Adamax, AdamW, RAdam, NAdam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
@@ -19,23 +20,50 @@ from dalle_pytorch.loader import TextImageDataset
 from dalle_pytorch.tokenizer import tokenizer, HugTokenizer, ChineseTokenizer, YttmTokenizer
 
 # libraries needed for webdataset support
-
 import webdataset as wds
 from torchvision import transforms as T
 from PIL import Image
 from io import BytesIO
 
+CFG_PATH = "../configs/train_config.yaml"
+CFG_EXISTS = Path(CFG_PATH).exists()
 
-ADAM = 'Adam'
+if CFG_EXISTS:
+    with open("../configs/train_config.yaml", "r") as f:
+        cfg = yaml.load(f, Loader=yaml.FullLoader)
+
+USE_CFG = CFG_EXISTS and cfg['use_config']
+
+RESUME_PATH = cfg['dalle_path'] if USE_CFG else './dalle.pt'
+OUTPUT_NAME = cfg['dalle_output_file_name'] if USE_CFG else 'dalle'
+WANDB_NAME = cfg['wandb_name'] if USE_CFG else 'dalle_train_transformer'
+DATASET_PATH = cfg['image_text_folder'] if USE_CFG else '../Dataset'
+
+ADAM = 'Adam'  # works
 ADAMAX = 'Adamax'
-ADAGRAD = 'Adagrad'
-ADAMW = 'AdamW'
-RADAM = 'RAdam'
+ADAMW = 'AdamW'  # works
+RADAM = 'RAdam'  # works
 NADAM = 'NAdam'
-OPTIMIZER = ADAM
+OPTIMIZER = cfg['optimizer'] if USE_CFG else ADAM
 
-EPOCH_COUNT = 50
-DEPTH_COUNT = 8
+LEARNING_RATE = cfg['learning_rate'] if USE_CFG else 3e-4
+EPOCH_COUNT = cfg['epochs'] if USE_CFG else 5
+DEPTH_COUNT = cfg['depth'] if USE_CFG else 8
+START_BATCH_SIZE = cfg['batch_size'] if USE_CFG else 4
+CLIP_GRAD_NORM = cfg['clip_grad_norm'] if USE_CFG else 0.5
+START_HEADS = cfg['heads'] if USE_CFG else 8
+IMG_LOSS_WEIGHT = cfg['img_loss_weight'] if USE_CFG else 7
+MODEL_DIM_HEAD = cfg['dim_head'] if USE_CFG else 64
+RESIZE_RATIO = cfg['resize_ratio'] if USE_CFG else 0.75
+
+A_DROPOUT = cfg['attention_dropout'] if USE_CFG else 0.0
+F_DROPOUT = cfg['ff_dropout'] if USE_CFG else 0.0
+GEN_IMG_STEPS = cfg['img_gen_steps'] if USE_CFG else 50
+TOP_K = cfg['top_k'] if USE_CFG else [0.7, 0.8, 0.9]
+TEMPERATURE = cfg['temperature'] if USE_CFG else [1.0, 1.0, 1.0]
+
+VQ_CHECKPOINT = None
+VQ_CONFIG = None
 
 
 class Colors:
@@ -62,29 +90,36 @@ def print_warn(msg):
 parser = argparse.ArgumentParser()
 group = parser.add_mutually_exclusive_group(required=False)
 
-group.add_argument('--vae_path', type=str, default='./city_vae-final.pt',
+group.add_argument('--vae_path', type=str,
+                   #default='./characters_vae.pt',
+                   default='./city_vae-final.pt',
                    help='path to your trained discrete VAE')
 
-group.add_argument('--dalle_path', type=str, default='./dalle.pt',
+group.add_argument('--dalle_path', type=str, default=RESUME_PATH,
                    help='path to your partially trained DALL-E')
 
-parser.add_argument('--vqgan_model_path', type=str, default=None,
-                    help='path to your trained VQGAN weights. This should be a .ckpt file. (only valid when taming option is enabled)')
+parser.add_argument('--vqgan_model_path', type=str, default=VQ_CHECKPOINT,
+                    help='path to your trained VQGAN weights. This should be a .ckpt file. '
+                         '(only valid when taming option is enabled)')
 
-parser.add_argument('--vqgan_config_path', type=str, default=None,
-                    help='path to your trained VQGAN config. This should be a .yaml file. (only valid when taming option is enabled)')
+parser.add_argument('--vqgan_config_path', type=str, default=VQ_CONFIG,
+                    help='path to your trained VQGAN config. This should be a .yaml file. '
+                         '(only valid when taming option is enabled)')
 
 parser.add_argument('--image_text_folder', type=str,
-                    default='C:\\Users\\manue\\PycharmProjects\\Staging\\DALLE\\Dataset',
+                    default=DATASET_PATH,
                     help='path to your folder of images and text for learning the DALL-E')
 
 parser.add_argument('--wds', type=str, default='',
-                    help='Comma separated list of WebDataset (1) image and (2) text column names. Must contain 2 values, e.g. img,cap.')
+                    help='Comma separated list of WebDataset (1) image and (2) text column names. '
+                         'Must contain 2 values, e.g. img,cap.')
 
 parser.add_argument('--truncate_captions', dest='truncate_captions', action='store_true',
-                    help='Captions passed in which exceed the max token length will be truncated if this is set.')
+                    help='Captions passed in which exceed the max token length will be '
+                         'truncated if this is set.')
 
-parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', type=float, default=0.75,
+parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', type=float,
+                    default=RESIZE_RATIO,
                     help='Random resized crop lower ratio')
 
 parser.add_argument('--chinese', dest='chinese', action='store_true')
@@ -96,23 +131,26 @@ parser.add_argument('--hug', dest='hug', action='store_true')
 parser.add_argument('--bpe_path', type=str,
                     help='path to your BPE json file')
 
-parser.add_argument('--dalle_output_file_name', type=str, default="dalle",
+parser.add_argument('--dalle_output_file_name', type=str,
+                    default=OUTPUT_NAME,
                     help='output_file_name')
 
 parser.add_argument('--fp16', action='store_true',
                     help='(experimental) - Enable DeepSpeed 16 bit precision. Reduces VRAM.')
 
 parser.add_argument('--amp', action='store_true',
-                    help='Apex "O1" automatic mixed precision. More stable than 16 bit precision. Can\'t be used in conjunction with deepspeed zero stages 1-3.')
+                    help='Apex "O1" automatic mixed precision. More stable than 16 bit precision. '
+                         'Can\'t be used in conjunction with deepspeed zero stages 1-3.')
 
-parser.add_argument('--wandb_name', default='dalle_train_transformer',
+parser.add_argument('--wandb_name', default=WANDB_NAME,
                     help='Name W&B will use when saving results.\ne.g. `--wandb_name "coco2017-full-sparse"`')
 
 parser.add_argument('--wandb_entity', default=None,
                     help='(optional) Name of W&B team/entity to log to.')
 
 parser.add_argument('--stable_softmax', dest='stable_softmax', action='store_true',
-                    help='Prevent values from becoming too large during softmax. Helps with stability in fp16 and Mixture of Quantization training.')
+                    help='Prevent values from becoming too large during softmax. '
+                         'Helps with stability in fp16 and Mixture of Quantization training.')
 
 parser = distributed_utils.wrap_arg_parser(parser)
 
@@ -128,14 +166,14 @@ train_group.add_argument('--save_every_n_steps', default=1000, type=int, help='S
 train_group.add_argument('--keep_n_checkpoints', default=None, type=int,
                          help='(Careful) Deletes old deepspeed checkpoints if there are more than n')
 
-train_group.add_argument('--batch_size', default=4, type=int, help='Batch size')
+train_group.add_argument('--batch_size', default=START_BATCH_SIZE, type=int, help='Batch size')
 
 train_group.add_argument('--ga_steps', default=1, type=int,
                          help='Number of steps to accumulate gradients across per each iteration. DeepSpeed only.')
 
-train_group.add_argument('--learning_rate', default=3e-4, type=float, help='Learning rate')
+train_group.add_argument('--learning_rate', default=LEARNING_RATE, type=float, help='Learning rate')
 
-train_group.add_argument('--clip_grad_norm', default=0.5, type=float, help='Clip gradient norm')
+train_group.add_argument('--clip_grad_norm', default=CLIP_GRAD_NORM, type=float, help='Clip gradient norm')
 
 train_group.add_argument('--lr_decay', dest='lr_decay', action='store_true')
 
@@ -147,20 +185,21 @@ model_group.add_argument('--text_seq_len', default=256, type=int, help='Text seq
 
 model_group.add_argument('--depth', default=DEPTH_COUNT, type=int, help='Model depth') #default=2
 
-model_group.add_argument('--heads', default=8, type=int, help='Model number of heads')
+model_group.add_argument('--heads', default=START_HEADS, type=int, help='Model number of heads')
 
-model_group.add_argument('--dim_head', default=64, type=int, help='Model head dimension')
+model_group.add_argument('--dim_head', default=MODEL_DIM_HEAD, type=int, help='Model head dimension')
 
-train_group.add_argument('--ff_dropout', default=0.0, type=float, help='Feed forward dropout.')
+train_group.add_argument('--ff_dropout', default=F_DROPOUT, type=float, help='Feed forward dropout.')
 
-train_group.add_argument('--attn_dropout', default=0.0, type=float, help='Feed forward dropout.')
+train_group.add_argument('--attn_dropout', default=A_DROPOUT, type=float, help='Feed forward dropout.')
 
 model_group.add_argument('--reversible', dest='reversible', action='store_true')
 
-model_group.add_argument('--loss_img_weight', default=7, type=int, help='Image loss weight')
+model_group.add_argument('--loss_img_weight', default=IMG_LOSS_WEIGHT, type=int, help='Image loss weight')
 
 model_group.add_argument('--attn_types', default='full', type=str,
-                         help='comma separated list of attention types. attention type can be: full or sparse or axial_row or axial_col or conv_like.')
+                         help='comma separated list of attention types. '
+                              'attention type can be: full or sparse or axial_row or axial_col or conv_like.')
 
 model_group.add_argument('--shift_tokens', help='Use the shift tokens feature', action='store_true')
 
@@ -223,7 +262,7 @@ BATCH_SIZE = args.batch_size
 
 LEARNING_RATE = args.learning_rate
 GRAD_CLIP_NORM = args.clip_grad_norm
-LR_DECAY = args.lr_decay
+LR_DECAY = cfg['lr_decay'] if USE_CFG else args.lr_decay
 SAVE_EVERY_N_STEPS = args.save_every_n_steps
 KEEP_N_CHECKPOINTS = args.keep_n_checkpoints
 
@@ -232,13 +271,13 @@ TEXT_SEQ_LEN = args.text_seq_len
 DEPTH = args.depth
 HEADS = args.heads
 DIM_HEAD = args.dim_head
-REVERSIBLE = args.reversible
+REVERSIBLE = cfg['reversible'] if USE_CFG else args.reversible
 LOSS_IMG_WEIGHT = args.loss_img_weight
 FF_DROPOUT = args.ff_dropout
 ATTN_DROPOUT = args.attn_dropout
-STABLE = args.stable_softmax
-SHIFT_TOKENS = args.shift_tokens
-ROTARY_EMB = args.rotary_emb
+STABLE = cfg['stable_softmax'] if USE_CFG else args.stable_softmax
+SHIFT_TOKENS = cfg['shift_tokens'] if USE_CFG else args.shift_tokens
+ROTARY_EMB = cfg['rotary_emb'] if USE_CFG else args.rotary_emb
 
 ATTN_TYPES = tuple(args.attn_types.split(','))
 SHARED_ATTN_IDS = tuple(args.shared_attn_ids.split(',')) if exists(args.shared_attn_ids) else None
@@ -271,7 +310,6 @@ else:
             args.image_text_folder))
 
 # initialize distributed backend
-
 distr_backend = distributed_utils.set_backend_from_args(args)
 distr_backend.initialize()
 
@@ -408,7 +446,8 @@ def tokenize(s):
     return tokenizer.tokenize(
         s.decode('utf-8'),
         TEXT_SEQ_LEN,
-        truncate_text=args.truncate_captions).squeeze(0)
+        truncate_text= cfg['truncate_captions'] if USE_CFG else args.truncate_captions
+    ).squeeze(0)
 
 
 if ENABLE_WEBDATASET:
@@ -483,24 +522,47 @@ if not using_deepspeed:
     if args.fp16:
         dalle = dalle.half()
     dalle = dalle.cuda()
-
-if RESUME and not using_deepspeed:
-    dalle.load_state_dict(weights)
+    if RESUME:
+        dalle.load_state_dict(weights)
 
 # optimizer
 
 if OPTIMIZER == ADAMAX:
-    opt = Adamax(get_trainable_params(dalle), lr=LEARNING_RATE)
-elif OPTIMIZER == ADAGRAD:
-    opt = Adagrad(get_trainable_params(dalle), lr=LEARNING_RATE)
+    opt = Adamax(get_trainable_params(dalle),
+                 lr=LEARNING_RATE,
+                 betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
+                 weight_decay=cfg['weight_decay'] if USE_CFG else 0,
+                 eps=cfg['epsilon'] if USE_CFG else 1e-8
+                 )
 elif OPTIMIZER == ADAMW:
-    opt = AdamW(get_trainable_params(dalle), lr=LEARNING_RATE)
+    opt = AdamW(get_trainable_params(dalle),
+                lr=LEARNING_RATE,
+                betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
+                weight_decay=cfg['weight_decay'] if USE_CFG else 0,
+                eps=cfg['epsilon'] if USE_CFG else 1e-8
+                )
 elif OPTIMIZER == RADAM:
-    opt = RAdam(get_trainable_params(dalle), lr=LEARNING_RATE)
+    opt = RAdam(get_trainable_params(dalle),
+                lr=LEARNING_RATE,
+                betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
+                weight_decay=cfg['weight_decay'] if USE_CFG else 0,
+                eps=cfg['epsilon'] if USE_CFG else 1e-8
+                )
 elif OPTIMIZER == NADAM:
-    opt = NAdam(get_trainable_params(dalle), lr=LEARNING_RATE)
+    opt = NAdam(get_trainable_params(dalle),
+                lr=LEARNING_RATE,
+                betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
+                weight_decay=cfg['weight_decay'] if USE_CFG else 0,
+                eps=cfg['epsilon'] if USE_CFG else 1e-8
+                )
 else:
-    opt = Adam(get_trainable_params(dalle), lr=LEARNING_RATE)
+    opt = Adam(
+        get_trainable_params(dalle),
+        lr=LEARNING_RATE,
+        betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
+        weight_decay=cfg['weight_decay'] if USE_CFG else 0,
+        eps=cfg['epsilon'] if USE_CFG else 1e-8
+    )
 
 print_blue(f"using optimizer {OPTIMIZER}")
 
@@ -551,7 +613,7 @@ deepspeed_config = {
         'enabled': args.fp16,
     },
     'amp': {
-        'enabled': args.amp,
+        'enabled': cfg['amp'] if USE_CFG else args.amp,
         'opt_level': 'O1',
     },
     "flops_profiler": {
@@ -665,6 +727,8 @@ save_model(DALLE_OUTPUT_FILE_NAME, epoch=resume_epoch)
 current_epoch = resume_epoch
 target_epoch = current_epoch + EPOCHS
 
+img_index = 0
+
 for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
     if data_sampler:
         data_sampler.set_epoch(epoch)
@@ -696,7 +760,7 @@ for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
         log = {}
 
         if i % 10 == 0 and is_root:
-            print(epoch, i, f'loss - {avg_loss.item()}')
+            print_blue(f'{epoch} {i} loss - {avg_loss.item()}')
 
             log = {
                 **log,
@@ -708,22 +772,27 @@ for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
         if i % SAVE_EVERY_N_STEPS == 0:
             save_model(DALLE_OUTPUT_FILE_NAME, epoch=epoch)
 
-        if i % 100 == 0 and is_root:
+        if i % GEN_IMG_STEPS == 0 and is_root:
             sample_text = text[:1]
             token_list = sample_text.masked_select(sample_text != 0).tolist()
             decoded_text = tokenizer.decode(token_list)
 
             if not avoid_model_calls:
                 # CUDA index errors when we don't guard this
-                image = dalle.generate_images(text[:1], filter_thres=0.9)  # topk sampling at 0.9
-
-            if not avoid_model_calls:
+                image = dalle.generate_images(
+                    text[:1],
+                    filter_thres=TOP_K[img_index],
+                    temperature=TEMPERATURE[img_index]
+                )
                 log['image'] = wandb.Image(image, caption=decoded_text)
+                img_index = img_index + 1
+                if img_index > len(TOP_K) - 1:
+                    img_index = 0
 
         if i % 10 == 9 and is_root:
             sample_per_sec = BATCH_SIZE * 10 / (time.time() - t)
             log["sample_per_sec"] = sample_per_sec
-            print(epoch, i, f'sample_per_sec - {sample_per_sec}')
+            print_blue(f'{epoch} {i} sample_per_sec - {sample_per_sec}')
 
         if i == 201 and args.flops_profiler:
             raise StopIteration("Profiler has finished running. Stopping training early.")
