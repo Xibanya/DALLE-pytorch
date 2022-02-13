@@ -46,7 +46,7 @@ RADAM = 'RAdam'  # works
 NADAM = 'NAdam'
 OPTIMIZER = cfg['optimizer'] if USE_CFG else ADAM
 
-LEARNING_RATE = cfg['learning_rate'] if USE_CFG else 3e-4
+LEARNING_RATE = float(cfg['learning_rate']) if USE_CFG else 3e-4
 EPOCH_COUNT = cfg['epochs'] if USE_CFG else 5
 DEPTH_COUNT = cfg['depth'] if USE_CFG else 8
 START_BATCH_SIZE = cfg['batch_size'] if USE_CFG else 4
@@ -279,6 +279,8 @@ STABLE = cfg['stable_softmax'] if USE_CFG else args.stable_softmax
 SHIFT_TOKENS = cfg['shift_tokens'] if USE_CFG else args.shift_tokens
 ROTARY_EMB = cfg['rotary_emb'] if USE_CFG else args.rotary_emb
 
+FP_16 = cfg['fp16'] if USE_CFG else args.fp16
+
 ATTN_TYPES = tuple(args.attn_types.split(','))
 SHARED_ATTN_IDS = tuple(args.shared_attn_ids.split(',')) if exists(args.shared_attn_ids) else None
 SHARED_FF_IDS = tuple(args.shared_ff_ids.split(',')) if exists(args.shared_ff_ids) else None
@@ -404,7 +406,7 @@ else:
 
 # configure OpenAI VAE for float16s
 
-if isinstance(vae, OpenAIDiscreteVAE) and args.fp16:
+if isinstance(vae, OpenAIDiscreteVAE) and FP_16:
     vae.enc.blocks.output.conv.use_float16 = True
 
 
@@ -519,7 +521,7 @@ else:
 dalle = DALLE(vae=vae, **dalle_params)
 
 if not using_deepspeed:
-    if args.fp16:
+    if FP_16:
         dalle = dalle.half()
     dalle = dalle.cuda()
     if RESUME:
@@ -539,7 +541,8 @@ elif OPTIMIZER == ADAMW:
                 lr=LEARNING_RATE,
                 betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
                 weight_decay=cfg['weight_decay'] if USE_CFG else 0,
-                eps=cfg['epsilon'] if USE_CFG else 1e-8
+                eps=cfg['epsilon'] if USE_CFG else 1e-8,
+                amsgrad=cfg['amsgrad'] if USE_CFG else False
                 )
 elif OPTIMIZER == RADAM:
     opt = RAdam(get_trainable_params(dalle),
@@ -561,10 +564,11 @@ else:
         lr=LEARNING_RATE,
         betas=(cfg['beta1'], cfg['beta2']) if USE_CFG else (0.9, 0.999),
         weight_decay=cfg['weight_decay'] if USE_CFG else 0,
-        eps=cfg['epsilon'] if USE_CFG else 1e-8
+        eps=float(cfg['epsilon']) if USE_CFG else 1e-8,
+        amsgrad=cfg['amsgrad'] if USE_CFG else False
     )
 
-print_blue(f"using optimizer {OPTIMIZER}")
+print_blue(f"using optimizer {OPTIMIZER}\nlearning rate: {LEARNING_RATE}\n")
 
 if RESUME and opt_state:
     opt.load_state_dict(opt_state)
@@ -577,10 +581,12 @@ if LR_DECAY:
     scheduler = ReduceLROnPlateau(
         opt,
         mode="min",
-        factor=0.5,
-        patience=10,
-        cooldown=10,
-        min_lr=1e-6,
+        factor=cfg['decay_factor'] if USE_CFG else 0.5,
+        patience=cfg['patience'] if USE_CFG else 10,
+        cooldown=cfg['cooldown'] if USE_CFG else 10,
+        min_lr=float(cfg['min_lr']) if USE_CFG else 1e-6,
+        threshold=float(cfg['threshold']) if USE_CFG else 1e-4,
+        eps=float(cfg['eps']) if USE_CFG else 1e-8,
         verbose=True,
     )
     if RESUME and scheduler_state:
@@ -610,7 +616,7 @@ deepspeed_config = {
     'gradient_accumulation_steps': args.ga_steps,
     'gradient_clipping': GRAD_CLIP_NORM,
     'fp16': {
-        'enabled': args.fp16,
+        'enabled': FP_16,
     },
     'amp': {
         'enabled': cfg['amp'] if USE_CFG else args.amp,
@@ -655,7 +661,7 @@ if deepspeed_config.get('zero_optimization', {}).get('stage', 0) >= 2:
 if LR_DECAY and distr_scheduler is None:
     distr_scheduler = scheduler
 
-avoid_model_calls = using_deepspeed and args.fp16
+avoid_model_calls = using_deepspeed and FP_16
 
 if RESUME and using_deepspeed:
     distr_dalle.load_checkpoint(str(cp_dir))
@@ -727,7 +733,8 @@ save_model(DALLE_OUTPUT_FILE_NAME, epoch=resume_epoch)
 current_epoch = resume_epoch
 target_epoch = current_epoch + EPOCHS
 
-img_index = 0
+topk_index = 0
+temp_index = 0
 
 for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
     if data_sampler:
@@ -737,7 +744,7 @@ for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
         if i % 10 == 0 and is_root:
             t = time.time()
 
-        if args.fp16:
+        if FP_16:
             images = images.half()
 
         text, images = map(lambda t: t.cuda(), (text, images))
@@ -760,8 +767,12 @@ for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
         log = {}
 
         if i % 10 == 0 and is_root:
-            print_blue(f'{epoch} {i} loss - {avg_loss.item()}')
-
+            GAP = ' ' if i < 100 else ''
+            if i == 0:
+                GAP = '  '
+                print_blue(f'\n{epoch} {GAP}{i} loss - {avg_loss.item()}')
+            else:
+                print_blue(f'{epoch} {GAP}{i} loss - {avg_loss.item()}')
             log = {
                 **log,
                 'epoch': epoch,
@@ -778,21 +789,24 @@ for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
             decoded_text = tokenizer.decode(token_list)
 
             if not avoid_model_calls:
-                # CUDA index errors when we don't guard this
                 image = dalle.generate_images(
                     text[:1],
-                    filter_thres=TOP_K[img_index],
-                    temperature=TEMPERATURE[img_index]
+                    filter_thres=TOP_K[min(topk_index, len(TOP_K) - 1)],
+                    temperature=TEMPERATURE[min(temp_index, len(TEMPERATURE) - 1)]
                 )
                 log['image'] = wandb.Image(image, caption=decoded_text)
-                img_index = img_index + 1
-                if img_index > len(TOP_K) - 1:
-                    img_index = 0
+                topk_index = topk_index + 1
+                if topk_index > len(TOP_K) - 1:
+                    topk_index = 0
+                temp_index = temp_index + 1
+                if temp_index > len(TEMPERATURE) - 1:
+                    temp_index = 0
 
         if i % 10 == 9 and is_root:
             sample_per_sec = BATCH_SIZE * 10 / (time.time() - t)
             log["sample_per_sec"] = sample_per_sec
-            print_blue(f'{epoch} {i} sample_per_sec - {sample_per_sec}')
+            if not USE_CFG or (USE_CFG and cfg['verbose_sample_per_sec']):
+                print(f'{epoch} {i} sample_per_sec - {sample_per_sec}')
 
         if i == 201 and args.flops_profiler:
             raise StopIteration("Profiler has finished running. Stopping training early.")
@@ -800,8 +814,8 @@ for epoch in tqdm(range(resume_epoch, target_epoch), colour='green'):
         if is_root:
             wandb.log(log)
 
-    if LR_DECAY:
-        distr_scheduler.step(avg_loss)
+        if LR_DECAY:
+            distr_scheduler.step(avg_loss)
 
     save_model(DALLE_OUTPUT_FILE_NAME, epoch=epoch)
 
